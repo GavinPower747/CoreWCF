@@ -26,6 +26,7 @@ namespace CoreWCF.Dispatcher
         internal readonly ServiceHostBase Host;
         internal readonly OperationContext OperationContext;
         //internal ServiceModelActivity Activity;
+        internal Activity? Activity;
         internal Guid ResponseActivityId;
         internal IAsyncResult AsyncResult;
         internal Task TaskResult;
@@ -190,7 +191,8 @@ namespace CoreWCF.Dispatcher
             {
                 requestContext.Abort();
 
-                /* ReceiveContextRPCFacet */ ReceiveContext receiveContext = ReceiveContext;
+                /* ReceiveContextRPCFacet */
+                ReceiveContext receiveContext = ReceiveContext;
 
                 if (receiveContext != null)
                 {
@@ -259,7 +261,8 @@ namespace CoreWCF.Dispatcher
             {
                 await context.CloseAsync();
 
-                /* ReceiveContextRPCFacet */ ReceiveContext receiveContext = ReceiveContext;
+                /* ReceiveContextRPCFacet */
+                ReceiveContext receiveContext = ReceiveContext;
                 if (receiveContext != null)
                 {
                     ReceiveContext = null;
