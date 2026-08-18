@@ -9,6 +9,9 @@ using System.Threading;
 using System.Threading.Tasks;
 using CoreWCF.Channels;
 using CoreWCF.Configuration;
+using CoreWCF.Description;
+using CoreWCF.Dispatcher;
+using Extensibility;
 using Helpers;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.Extensions.DependencyInjection;
@@ -146,6 +149,115 @@ public class TelemetryTests
         Assert.Equivalent(startedTags[4], stoppedTags[4]);
         Assert.Equivalent(startedTags[5], stoppedTags[5]);
         Assert.Equivalent(startedTags[6], stoppedTags[6]);
+    }
+
+    [Fact]
+    public async Task Overlapping_Requests_Stop_Their_Own_Activities()
+    {
+        const string telemetryEchoAction = "http://tempuri.org/ISimpleTelemetryService/Echo";
+        const string serviceAddress = "http://localhost/telemetry-overlap";
+        var startedActivities = new ConcurrentBag<Activity>();
+        var stoppedActivities = new ConcurrentBag<Activity>();
+        using var inspector = new OverlappingRequestInspector(TestContext.Current.CancellationToken);
+
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = activitySource => activitySource.Name == "CoreWCF.Primitives",
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStarted = activity => startedActivities.Add(activity),
+            ActivityStopped = activity => stoppedActivities.Add(activity)
+        };
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddServiceModelServices();
+        services.AddSingleton<IServiceBehavior>(new TestServiceBehavior { DispatchMessageInspector = inspector });
+        services.AddSingleton<IServer>(new MockServer());
+        services.AddSingleton(typeof(ILogger<>), typeof(NullLogger<>));
+        services.RegisterApplicationLifetime();
+        using ServiceProvider serviceProvider = services.BuildServiceProvider();
+        IServiceBuilder serviceBuilder = serviceProvider.GetRequiredService<IServiceBuilder>();
+        serviceBuilder.BaseAddresses.Add(new Uri(serviceAddress));
+        serviceBuilder.AddService<SimpleTelemetryService>();
+        var binding = new CustomBinding("BindingName", "BindingNS");
+        binding.Elements.Add(new MockTransportBindingElement());
+        serviceBuilder.AddServiceEndpoint<SimpleTelemetryService, ISimpleTelemetryService>(binding, serviceAddress);
+        await serviceBuilder.OpenAsync(TestContext.Current.CancellationToken);
+
+        IServiceDispatcher serviceDispatcher = Assert.Single(
+            serviceProvider.GetRequiredService<IDispatcherBuilder>().BuildDispatchers(typeof(SimpleTelemetryService)));
+        IServiceChannelDispatcher dispatcher = await serviceDispatcher.CreateServiceChannelDispatcherAsync(
+            new MockReplyChannel(serviceProvider));
+        var firstRequest = TestRequestContext.Create(serviceAddress, telemetryEchoAction);
+        var secondRequest = TestRequestContext.Create(serviceAddress, telemetryEchoAction);
+
+        ActivitySource.AddActivityListener(listener);
+        Task firstDispatch = Task.Run(
+            async () => await dispatcher.DispatchAsync(firstRequest), TestContext.Current.CancellationToken);
+        await inspector.FirstRequestEntered;
+        Task secondDispatch = Task.Run(
+            async () => await dispatcher.DispatchAsync(secondRequest), TestContext.Current.CancellationToken);
+
+        await Task.WhenAll(firstDispatch, secondDispatch);
+        Assert.True(await firstRequest.WaitForReplyAsync(TestContext.Current.CancellationToken));
+        Assert.True(await secondRequest.WaitForReplyAsync(TestContext.Current.CancellationToken));
+
+        string[] startedSpanIds = startedActivities
+            .Where(activity => activity.DisplayName == telemetryEchoAction)
+            .Select(activity => activity.SpanId.ToHexString())
+            .OrderBy(id => id)
+            .ToArray();
+        string[] stoppedSpanIds = stoppedActivities
+            .Where(activity => activity.DisplayName == telemetryEchoAction)
+            .Select(activity => activity.SpanId.ToHexString())
+            .OrderBy(id => id)
+            .ToArray();
+
+        Assert.Equal(2, startedSpanIds.Length);
+        Assert.Equal(startedSpanIds, stoppedSpanIds);
+    }
+
+    private sealed class OverlappingRequestInspector : IDispatchMessageInspector, IDisposable
+    {
+        private readonly CancellationToken _cancellationToken;
+        private readonly CancellationTokenRegistration _cancellationRegistration;
+        private readonly TaskCompletionSource<bool> _firstRequestEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly ManualResetEventSlim _secondRequestEntered = new();
+        private int _requestCount;
+
+        public OverlappingRequestInspector(CancellationToken cancellationToken)
+        {
+            _cancellationToken = cancellationToken;
+            _cancellationRegistration = cancellationToken.Register(() => _firstRequestEntered.TrySetCanceled());
+        }
+
+        public Task FirstRequestEntered => _firstRequestEntered.Task;
+
+        public object AfterReceiveRequest(ref Message request, IClientChannel channel, InstanceContext instanceContext)
+        {
+            if (Interlocked.Increment(ref _requestCount) == 1)
+            {
+                _firstRequestEntered.TrySetResult(true);
+                _secondRequestEntered.Wait(_cancellationToken);
+            }
+            else
+            {
+                _secondRequestEntered.Set();
+            }
+
+            return null;
+        }
+
+        public void BeforeSendReply(ref Message reply, object correlationState)
+        {
+        }
+
+        public void Dispose()
+        {
+            _cancellationRegistration.Dispose();
+            _secondRequestEntered.Dispose();
+        }
     }
 
     [CoreWCF.ServiceContract]
